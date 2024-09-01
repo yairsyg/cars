@@ -1,0 +1,139 @@
+function New-MA
+{
+    
+
+    [CmdletBinding()]
+    param
+    (
+        [parameter(Mandatory=$false)][String]$DistinguishedName,
+        [parameter(Mandatory=$false)][String]$Domain,
+        [parameter(Mandatory=$false)][String]$DomainController,
+        [parameter(Mandatory=$true)][String]$MachineAccount,
+        [parameter(Mandatory=$false)][System.Security.SecureString]$Password,
+        [parameter(Mandatory=$false)][System.Management.Automation.PSCredential]$Credential,
+        [parameter(ValueFromRemainingArguments=$true)]$invalid_parameter
+    )
+
+    if($invalid_parameter)
+    {
+        Write-Output "[-] $($invalid_parameter) is not a valid parameter"
+        throw
+    }
+
+    $null = [System.Reflection.Assembly]::LoadWithPartialName("System.DirectoryServices.Protocols")
+
+    if(!$Password)
+    {
+        $password = Read-Host -Prompt "Enter a password for the new machine account" -AsSecureString
+    }
+
+    $password_BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($password)
+    $password_cleartext = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($password_BSTR)
+
+    if(!$DomainController -or !$Domain)
+    {
+
+        try
+        {
+            $current_domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+        }
+        catch
+        {
+            Write-Output "[-] $($_.Exception.Message)"
+            throw
+        }
+
+    }
+
+    if(!$DomainController)
+    {
+        $DomainController = $current_domain.PdcRoleOwner.Name
+        Write-Verbose "[+] Domain Controller = $DomainController"
+    }
+
+    if(!$Domain)
+    {
+        $Domain = $current_domain.Name
+        Write-Verbose "[+] Domain = $Domain"
+    }
+    
+    $Domain = $Domain.ToLower()
+    $machine_account = $MachineAccount
+
+    if($MachineAccount.EndsWith('$'))
+    {
+        $sam_account = $machine_account
+        $machine_account = $machine_account.SubString(0,$machine_account.Length - 1)
+    }
+    else 
+    {
+        $sam_account = $machine_account + "$"
+    }
+
+    Write-Verbose "[+] SAMAccountName = $sam_account" 
+
+    if(!$DistinguishedName)
+    {
+        $distinguished_name = "CN=$machine_account,CN=Computers"
+        $DC_array = $Domain.Split(".")
+
+        ForEach($DC in $DC_array)
+        {
+            $distinguished_name += ",DC=$DC"
+        }
+
+        Write-Verbose "[+] Distinguished Name = $distinguished_name"
+    }
+    else 
+    {
+        $distinguished_name = $DistinguishedName
+    }
+
+    $password_cleartext = [System.Text.Encoding]::Unicode.GetBytes('"' + $password_cleartext + '"')
+    $identifier = New-Object System.DirectoryServices.Protocols.LdapDirectoryIdentifier($DomainController,389)
+
+    if($Credential)
+    {
+        $connection = New-Object System.DirectoryServices.Protocols.LdapConnection($identifier,$Credential.GetNetworkCredential())
+    }
+    else
+    {
+        $connection = New-Object System.DirectoryServices.Protocols.LdapConnection($identifier)
+    }
+    
+    $connection.SessionOptions.Sealing = $true
+    $connection.SessionOptions.Signing = $true
+    $connection.Bind()
+    $request = New-Object -TypeName System.DirectoryServices.Protocols.AddRequest
+    $request.DistinguishedName = $distinguished_name
+    $request.Attributes.Add((New-Object "System.DirectoryServices.Protocols.DirectoryAttribute" -ArgumentList "objectClass","Computer")) > $null
+    $request.Attributes.Add((New-Object "System.DirectoryServices.Protocols.DirectoryAttribute" -ArgumentList "SamAccountName",$sam_account)) > $null
+    $request.Attributes.Add((New-Object "System.DirectoryServices.Protocols.DirectoryAttribute" -ArgumentList "userAccountControl","4096")) > $null
+    $request.Attributes.Add((New-Object "System.DirectoryServices.Protocols.DirectoryAttribute" -ArgumentList "DnsHostName","$machine_account.$Domain")) > $null
+    $request.Attributes.Add((New-Object "System.DirectoryServices.Protocols.DirectoryAttribute" -ArgumentList "ServicePrincipalName","HOST/$machine_account.$Domain",
+        "RestrictedKrbHost/$machine_account.$Domain","HOST/$machine_account","RestrictedKrbHost/$machine_account")) > $null
+    $request.Attributes.Add((New-Object "System.DirectoryServices.Protocols.DirectoryAttribute" -ArgumentList "unicodePwd",$password_cleartext)) > $null
+    Remove-Variable password_cleartext
+
+    try
+    {
+        $connection.SendRequest($request) > $null
+        Write-Output "[+] Machine account $MachineAccount added"
+    }
+    catch
+    {
+        Write-Output "[-] $($_.Exception.Message)"
+
+        if($error_message -like '*Exception calling "SendRequest" with "1" argument(s): "The server cannot handle directory requests."*')
+        {
+            Write-Output "[!] User may have reached ms-DS-MachineAccountQuota limit"
+        }
+
+    }
+
+    if($directory_entry.Path)
+    {
+        $directory_entry.Close()
+    }
+
+}
