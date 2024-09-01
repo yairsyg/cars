@@ -1,0 +1,140 @@
+param (
+    [string]$username,
+    [string]$serverFQDN 
+)
+
+function Get-NestedGroupMemberships {
+    param (
+        [string]$groupDN
+    )
+
+    $group = [ADSI]"LDAP://$groupDN"
+    $members = @()
+
+    foreach ($member in $group.memberof) {
+        $memberEntry = [ADSI]"LDAP://$member"
+        $members += $memberEntry.distinguishedName
+        $members += Get-NestedGroupMemberships -groupDN $memberEntry.distinguishedName
+    }
+
+    return $members
+}
+
+# Function to check if the current user has permission to create objects in the specified container
+function Check-ADPermission {
+    param (
+        [string]$targetContainer,
+        [Object[]]$InputObject
+    )
+
+    try {
+        # Get the current user's account name and domain SID
+        #$currentUserName = $user.Name
+        #$currentUsersid = $user.user
+        $currentDomainSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Translate([System.Security.Principal.SecurityIdentifier]).AccountDomainSid.Value
+        $groupMembership = $InputObject.DomainSID
+
+        # Create a directory entry for the target container
+        $containerEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$targetContainer")
+
+        # Get the security descriptor of the container
+        $containerSecurityDescriptor = $containerEntry.ObjectSecurity
+
+        # Numeric values corresponding to ActiveDirectoryRights enumeration
+        $createChildRights = 1
+
+        # Check if the current user has effective permission to create objects in the container
+        $createObjectPermission = $containerSecurityDescriptor.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) | Where-Object {
+            $_.IdentityReference.Value -eq $currentUsersid -or $_.IdentityReference.Value -in $groupMembership
+        } | ForEach-Object {
+            $_.AccessControlType -eq 'Allow' -and
+            $_.ActiveDirectoryRights -band $createChildRights -ne 0 -and
+            $_.InheritanceType -eq 'None'
+        }
+
+        if ($createObjectPermission -ne $null) {
+            Write-Host -ForegroundColor Green "[+] Current user has permission to create objects in $targetContainer."
+            return $true
+        }
+
+        #Write-Host -ForegroundColor Yellow "[-] Current user does not have permission to create objects in $targetContainer."
+        return $false
+    }
+    catch {
+        Write-Host "Error in Check-ADPermission: $_"
+        return $false
+    }
+}
+
+# Function to recursively search for containers where the current user has permission
+function Search-ADPermission {
+    param (
+        [string]$baseContainer,
+        [Object[]]$InputObject
+    )
+
+    try {
+        # Create a directory entry for the base container
+        $baseContainerEntry = New-Object System.DirectoryServices.DirectoryEntry($baseContainer)
+
+        # Get the child containers of the base container
+        $childContainers = $baseContainerEntry.Children | Where-Object {
+            $_.SchemaClassName -eq 'organizationalUnit' -or $_.SchemaClassName -eq 'container'
+        }
+
+        # Iterate through each child container
+        foreach ($childContainer in $childContainers) {
+            $childContainerDN = $childContainer.Properties["distinguishedName"].Value
+            $permissionResult = Check-ADPermission -targetContainer $childContainerDN -InputObject $InputObject
+            if ($permissionResult) {
+                Write-Host -ForegroundColor Green  "[+] User has permission to create objects in $childContainerDN"
+            }
+
+            # Recursively search child containers
+            Search-ADPermission -baseContainer $childContainerDN -InputObject $InputObject
+        }
+    }
+    catch {
+        Write-Host "Error: $_"
+    }
+}
+
+# LDAP connection details
+$ldapPath = "LDAP://dc01.lab.com"  # Replace with your LDAP server details
+$searchFilter = "(&(objectClass=user)(sAMAccountName=$username))"
+
+# Create LDAP search object
+$searcher = New-Object DirectoryServices.DirectorySearcher
+$searcher.SearchRoot = New-Object DirectoryServices.DirectoryEntry($ldapPath)
+$searcher.Filter = $searchFilter
+$searcher.PropertiesToLoad.Add("memberOf")
+$searcher.PropertiesToLoad.Add("objectSid")
+
+# Perform LDAP search
+$user = $searcher.FindOne()
+
+# Check if user was found
+if ($user) {
+    $userGroups = $user.Properties["memberOf"]
+    $userGroups += $user.Properties["memberOf"]| ForEach-Object {
+        Get-NestedGroupMemberships -groupDN $_
+    }
+
+    $groupObjects = $userGroups | ForEach-Object {
+        $group = [ADSI]"LDAP://$_"
+        foreach ($groupName in $group.Properties["cn"]) {
+            $sidBytes = $group.Properties["objectSid"][0]
+            $sid = New-Object System.Security.Principal.SecurityIdentifier($sidBytes, 0)
+
+            [PSCustomObject]@{
+                Name = $groupName
+                DomainSID = $sid.Value
+            }
+        }
+    }
+
+    # Perform the search
+    Search-ADPermission -baseContainer $ldapPath -InputObject $groupObjects
+} else {
+    Write-Output "User $username not found."
+}
